@@ -96,6 +96,11 @@
             <button data-cam="top" class="cam-btn px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">Top Down</button>
             <button data-cam="free" class="cam-btn px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">Free Orbit</button>
           </div>
+          <span class="w-px h-5 bg-slate-700"></span>
+          <div class="flex gap-1">
+            <button id="btn-view-fit" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">전체 보기</button>
+            <button id="btn-view-focus" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">드론 포커스</button>
+          </div>
         </div>
 
         <!-- Speed Selector Overlay -->
@@ -111,14 +116,18 @@
           </div>
         </div>
 
+        <!-- Orbit Hint -->
+        <div class="absolute bottom-4 right-4 bg-slate-900/70 backdrop-blur-md border border-slate-800 rounded-xl px-3 py-2 text-[11px] text-slate-400 z-10 hidden md:block pointer-events-none">
+          <i class="fa-solid fa-arrows-spin text-indigo-400"></i> 좌드래그 회전 · 우드래그/Shift+드래그 이동 · 휠 줌 · 더블클릭 전체 보기
+        </div>
+
         <!-- User Controls Guide Overlay -->
         <div class="absolute bottom-4 left-4 bg-slate-900/80 backdrop-blur-md border border-slate-800 rounded-xl p-3 text-[11px] text-slate-300 z-10 hidden md:block">
           <p class="font-bold text-emerald-400 mb-1"><i class="fa-solid fa-keyboard"></i> 유저 드론 3D 조종법:</p>
           <div class="grid grid-cols-2 gap-x-4 gap-y-0.5 text-slate-400">
             <span><b>W/S</b>: Pitch (전진/후진)</span>
-            <span><b>A/D</b>: Roll (좌/우 회전)</span>
+            <span><b>A/D · ◄/►</b>: Yaw (좌/우 선회)</span>
             <span><b>▲/▼</b>: Vertical Thrust (고도 상승/하강)</span>
-            <span><b>◄/►</b>: Yaw (좌/우 선회)</span>
           </div>
         </div>
       </div>
@@ -171,6 +180,8 @@
             <div class="space-y-1 text-xs">
               <div class="flex justify-between"><span class="text-slate-400">생존 드론:</span><span id="stat-rl-alive" class="font-mono font-bold text-slate-200">0/0</span></div>
               <div class="flex justify-between"><span class="text-slate-400">최고 피트니스:</span><span id="stat-rl-fit" class="font-mono font-bold text-amber-400">0</span></div>
+              <div class="flex justify-between"><span class="text-slate-400">평균 리턴:</span><span id="stat-rl-ret" class="font-mono font-bold text-slate-200">0</span></div>
+              <div class="flex justify-between"><span class="text-slate-400">탐색 σ:</span><span id="stat-rl-std" class="font-mono font-bold text-slate-200">0.50</span></div>
             </div>
           </div>
         </div>
@@ -196,6 +207,7 @@
         <button id="btn-regen-track" class="w-full py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl font-semibold text-indigo-400 flex items-center justify-center gap-2">
           <i class="fa-solid fa-shuffle"></i> 새로운 3D 곡선 튜브 무작위 생성
         </button>
+        <p id="track-info" class="text-[10px] text-slate-400 text-center -mt-2">현재 코스: 기본 코스 · 8각 단면</p>
 
         <div class="flex items-center justify-between bg-slate-950 border border-slate-800 p-2.5 rounded-xl">
           <div class="space-y-0.5">
@@ -339,17 +351,241 @@
       }
     }
 
+    // --- 1-B. UTIL ---
+    const HALF_LOG_2PI = 0.5 * Math.log(2 * Math.PI);
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+    function randn() {
+      let u = 0;
+      while (u === 0) u = Math.random();
+      const v = Math.random();
+      return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+    }
+    const CAM_ON = 'cam-btn px-2.5 py-1 rounded bg-indigo-600 text-white shadow';
+    const CAM_OFF = 'cam-btn px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300';
+
+    // --- 1-C. 1-hidden-layer MLP (수동 역전파 + Adam) ---
+    class TinyMLP {
+      constructor(nIn, nHid, nOut, nExtra = 0, outScale = 1.0) {
+        this.nIn = nIn; this.nHid = nHid; this.nOut = nOut; this.nExtra = nExtra;
+        this.oB1 = nHid * nIn;
+        this.oW2 = this.oB1 + nHid;
+        this.oB2 = this.oW2 + nOut * nHid;
+        this.oExtra = this.oB2 + nOut;
+        const total = this.oExtra + nExtra;
+        this.p = new Float64Array(total);
+        this.g = new Float64Array(total);
+        this.m = new Float64Array(total);
+        this.v = new Float64Array(total);
+        this.t = 0;
+        const s1 = Math.sqrt(1 / nIn);
+        const s2 = Math.sqrt(1 / nHid) * outScale;
+        for (let k = 0; k < this.oB1; k++) this.p[k] = randn() * s1;
+        for (let k = this.oW2; k < this.oB2; k++) this.p[k] = randn() * s2;
+        this._dh = new Float64Array(nHid);
+      }
+
+      forward(x, h, out) {
+        const { nIn, nHid, nOut, p, oB1, oW2, oB2 } = this;
+        for (let i = 0; i < nHid; i++) {
+          let s = p[oB1 + i];
+          const row = i * nIn;
+          for (let j = 0; j < nIn; j++) s += p[row + j] * x[j];
+          h[i] = Math.tanh(s);
+        }
+        for (let o = 0; o < nOut; o++) {
+          let s = p[oB2 + o];
+          const row = oW2 + o * nHid;
+          for (let i = 0; i < nHid; i++) s += p[row + i] * h[i];
+          out[o] = s;
+        }
+      }
+
+      // dOut: d(loss)/d(out). 기울기는 this.g 에 누적
+      backward(x, h, dOut) {
+        const { nIn, nHid, nOut, p, g, oB1, oW2, oB2 } = this;
+        const dh = this._dh;
+        dh.fill(0);
+        for (let o = 0; o < nOut; o++) {
+          const d = dOut[o];
+          g[oB2 + o] += d;
+          const row = oW2 + o * nHid;
+          for (let i = 0; i < nHid; i++) {
+            g[row + i] += d * h[i];
+            dh[i] += d * p[row + i];
+          }
+        }
+        for (let i = 0; i < nHid; i++) {
+          const dpre = dh[i] * (1 - h[i] * h[i]);
+          g[oB1 + i] += dpre;
+          const row = i * nIn;
+          for (let j = 0; j < nIn; j++) g[row + j] += dpre * x[j];
+        }
+      }
+
+      step(lr, maxNorm = 0.5) {
+        const { p, g, m, v } = this;
+        let norm = 0;
+        for (let k = 0; k < g.length; k++) norm += g[k] * g[k];
+        norm = Math.sqrt(norm);
+        const scale = norm > maxNorm ? maxNorm / norm : 1;
+        this.t++;
+        const b1 = 0.9, b2 = 0.999;
+        const c1 = 1 - Math.pow(b1, this.t), c2 = 1 - Math.pow(b2, this.t);
+        for (let k = 0; k < g.length; k++) {
+          const gk = g[k] * scale;
+          m[k] = b1 * m[k] + (1 - b1) * gk;
+          v[k] = b2 * v[k] + (1 - b2) * gk * gk;
+          p[k] -= lr * (m[k] / c1) / (Math.sqrt(v[k] / c2) + 1e-8);
+          g[k] = 0;
+        }
+      }
+    }
+
+    // --- 1-D. PPO ACTOR-CRITIC (모든 RL 드론이 하나의 정책을 공유, 경험을 모아 경사하강) ---
+    class PPOAgent {
+      constructor(obsDim = 17, actDim = 3, hidden = 32) {
+        this.obsDim = obsDim; this.actDim = actDim;
+        this.actor = new TinyMLP(obsDim, hidden, actDim, actDim, 0.05); // 마지막 actDim 개 = log σ
+        this.critic = new TinyMLP(obsDim, hidden, 1, 0, 1.0);
+        for (let i = 0; i < actDim; i++) this.actor.p[this.actor.oExtra + i] = Math.log(0.5);
+
+        this.gamma = 0.99; this.lambda = 0.95; this.clipEps = 0.2;
+        this.epochs = 4; this.mbSize = 256; this.maxSamples = 8192;
+        this.entCoef = 0.003; this.vCoef = 0.5;
+        this.updates = 0;
+
+        this._h = new Float64Array(hidden); this._out = new Float64Array(actDim);
+        this._hc = new Float64Array(hidden); this._oc = new Float64Array(1);
+        this._dOut = new Float64Array(actDim); this._dV = new Float64Array(1);
+      }
+
+      meanStd() {
+        let s = 0;
+        for (let i = 0; i < this.actDim; i++) s += Math.exp(this.actor.p[this.actor.oExtra + i]);
+        return s / this.actDim;
+      }
+
+      value(obs) {
+        this.critic.forward(obs, this._hc, this._oc);
+        return this._oc[0];
+      }
+
+      act(obs) {
+        this.actor.forward(obs, this._h, this._out);
+        const action = [];
+        let logp = 0;
+        for (let i = 0; i < this.actDim; i++) {
+          const m = Math.tanh(this._out[i]);
+          const ls = this.actor.p[this.actor.oExtra + i];
+          const std = Math.exp(ls);
+          const a = m + std * randn();
+          logp += -0.5 * ((a - m) / std) ** 2 - ls - HALF_LOG_2PI;
+          action.push(a);
+        }
+        return { action, logp, value: this.value(obs) };
+      }
+
+      _accumulate(s, mb) {
+        const { actor, critic, actDim } = this;
+        const x = s.obs;
+        actor.forward(x, this._h, this._out);
+        const ms = [], stds = [], zs = [];
+        let logp = 0;
+        for (let i = 0; i < actDim; i++) {
+          const m = Math.tanh(this._out[i]);
+          const ls = actor.p[actor.oExtra + i];
+          const std = Math.exp(ls);
+          const z = (s.act[i] - m) / std;
+          logp += -0.5 * z * z - ls - HALF_LOG_2PI;
+          ms.push(m); stds.push(std); zs.push(z);
+        }
+        const ratio = Math.exp(clamp(logp - s.logp, -20, 20));
+        const A = s.adv;
+        const clipped = (A >= 0 && ratio > 1 + this.clipEps) || (A < 0 && ratio < 1 - this.clipEps);
+        if (clipped) this._clipCount++;
+        const coef = clipped ? 0 : -ratio * A / mb; // d(loss)/d(logp)
+        for (let i = 0; i < actDim; i++) {
+          this._dOut[i] = coef * (zs[i] / stds[i]) * (1 - ms[i] * ms[i]);
+          actor.g[actor.oExtra + i] += coef * (zs[i] * zs[i] - 1) - this.entCoef / mb;
+        }
+        actor.backward(x, this._h, this._dOut);
+
+        critic.forward(x, this._hc, this._oc);
+        const err = this._oc[0] - s.ret;
+        this._vLoss += 0.5 * err * err;
+        this._dV[0] = this.vCoef * err / mb;
+        critic.backward(x, this._hc, this._dV);
+      }
+
+      // trajs: [{ steps:[{obs,act,logp,v,r,done}], bootstrap }]
+      train(trajs, lr = 0.001) {
+        const samples = [];
+        for (const { steps, bootstrap } of trajs) {
+          let lastAdv = 0;
+          for (let t = steps.length - 1; t >= 0; t--) {
+            const s = steps[t];
+            const nonTerminal = s.done ? 0 : 1;
+            const nextV = (t === steps.length - 1) ? bootstrap : steps[t + 1].v;
+            const delta = s.r + this.gamma * nextV * nonTerminal - s.v;
+            lastAdv = delta + this.gamma * this.lambda * nonTerminal * lastAdv;
+            samples.push({ obs: s.obs, act: s.act, logp: s.logp, adv: lastAdv, ret: lastAdv + s.v });
+          }
+        }
+        if (samples.length < 32) return null;
+        if (samples.length > this.maxSamples) {
+          const total = samples.length;
+          for (let i = 0; i < this.maxSamples; i++) {
+            const j = i + Math.floor(Math.random() * (total - i));
+            const tmp = samples[i]; samples[i] = samples[j]; samples[j] = tmp;
+          }
+          samples.length = this.maxSamples;
+        }
+        const N = samples.length;
+        let mean = 0;
+        for (const s of samples) mean += s.adv;
+        mean /= N;
+        let vr = 0;
+        for (const s of samples) vr += (s.adv - mean) ** 2;
+        const sd = Math.sqrt(vr / N) + 1e-8;
+        for (const s of samples) s.adv = (s.adv - mean) / sd;
+
+        this._clipCount = 0; this._vLoss = 0;
+        const idx = Array.from({ length: N }, (_, i) => i);
+        for (let ep = 0; ep < this.epochs; ep++) {
+          for (let i = N - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+          }
+          for (let st = 0; st < N; st += this.mbSize) {
+            const en = Math.min(N, st + this.mbSize);
+            const mb = en - st;
+            for (let k = st; k < en; k++) this._accumulate(samples[idx[k]], mb);
+            this.actor.step(lr, 0.5);
+            this.critic.step(lr, 1.0);
+            for (let i = 0; i < this.actDim; i++) {
+              const k = this.actor.oExtra + i;
+              this.actor.p[k] = clamp(this.actor.p[k], -2.0, 0.3);
+            }
+          }
+        }
+        this.updates++;
+        const tot = N * this.epochs;
+        return { n: N, clipFrac: this._clipCount / tot, vLoss: this._vLoss / tot, std: this.meanStd() };
+      }
+    }
+
     // --- 2. 3D DRONE MODEL & PHYSICS ---
     class Drone3D {
-      constructor(scene, startPos, startQuaternion, modelType = 'GA') {
+      constructor(scene, startPos, startQuaternion, modelType = 'GA', agent = null) {
         this.scene = scene;
         this.modelType = modelType;
+        this.agent = agent;
         this.damaged = false;
 
         this.position = startPos.clone();
         this.quaternion = startQuaternion.clone();
         this.velocity = new THREE.Vector3();
-        
+
         this.pitch = 0;
         this.roll = 0;
         this.yaw = 0;
@@ -359,24 +595,27 @@
         this.currentRingIndex = 0;
         this.timeSinceCheckpoint = 0;
 
+        // RL 학습용 버퍼
+        this.traj = [];
+        this.pending = null;
+        this.prevDist = null;
+        this.stepReward = 0;
+
         // 3D Ray Sensors: 7 Rays (Front, Left, Right, Up, Down, Front-Up, Front-Down)
         this.rayDirections = [
-          new THREE.Vector3(0, 0, 1),   // Front
-          new THREE.Vector3(-1, 0, 0),  // Left
-          new THREE.Vector3(1, 0, 0),   // Right
-          new THREE.Vector3(0, 1, 0),   // Up
-          new THREE.Vector3(0, -1, 0),  // Down
-          new THREE.Vector3(0, 0.7, 0.7).normalize(),  // Front-Up
-          new THREE.Vector3(0, -0.7, 0.7).normalize() // Front-Down
+          new THREE.Vector3(0, 0, 1),
+          new THREE.Vector3(-1, 0, 0),
+          new THREE.Vector3(1, 0, 0),
+          new THREE.Vector3(0, 1, 0),
+          new THREE.Vector3(0, -1, 0),
+          new THREE.Vector3(0, 0.7, 0.7).normalize(),
+          new THREE.Vector3(0, -0.7, 0.7).normalize()
         ];
         this.sensorRange = 80;
         this.readings = new Array(7).fill(1.0);
 
-        if (modelType !== 'HUMAN') {
-          // Inputs: 7 sensors + 3 relative 3D ring target direction + 1 current speed = 11 inputs
-          // Outputs: 3 (Pitch control, Yaw control, Vertical Thrust)
-          this.brain = new NeuralNetwork(11, 12, 3);
-        }
+        // GA: 11입력(센서7 + 다음링 방향3 + 속도1) -> 3출력. RL은 PPOAgent(17입력) 사용
+        if (modelType === 'GA') this.brain = new NeuralNetwork(11, 12, 3);
 
         this.mesh = this.createDroneMesh();
         this.scene.add(this.mesh);
@@ -389,13 +628,10 @@
         const group = new THREE.Group();
         const color = this.modelType === 'HUMAN' ? 0x10b981 : (this.modelType === 'GA' ? 0x6366f1 : 0x22d3ee);
 
-        // Body Center
         const bodyGeo = new THREE.BoxGeometry(2, 0.8, 2);
         const bodyMat = new THREE.MeshStandardMaterial({ color: color, roughness: 0.3, metalness: 0.8 });
-        const body = new THREE.Mesh(bodyGeo, bodyMat);
-        group.add(body);
+        group.add(new THREE.Mesh(bodyGeo, bodyMat));
 
-        // 4 Quadcopter Arms
         const armGeo = new THREE.CylinderGeometry(0.2, 0.2, 6);
         armGeo.rotateX(Math.PI / 2);
         const armMat = new THREE.MeshStandardMaterial({ color: 0x334155 });
@@ -403,18 +639,13 @@
         const arm1 = new THREE.Mesh(armGeo, armMat);
         arm1.rotation.y = Math.PI / 4;
         group.add(arm1);
-
         const arm2 = new THREE.Mesh(armGeo, armMat);
         arm2.rotation.y = -Math.PI / 4;
         group.add(arm2);
 
-        // Rotors
         const rotorGeo = new THREE.CylinderGeometry(1.2, 1.2, 0.1, 8);
         const rotorMat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 0.7, wireframe: true });
-
-        const rotorPositions = [
-          [2, 0.5, 2], [-2, 0.5, 2], [2, 0.5, -2], [-2, 0.5, -2]
-        ];
+        const rotorPositions = [[2, 0.5, 2], [-2, 0.5, 2], [2, 0.5, -2], [-2, 0.5, -2]];
 
         this.rotors = [];
         rotorPositions.forEach(p => {
@@ -430,7 +661,6 @@
       }
 
       createSensorLineGraphics() {
-        this.lineGeometries = [];
         for (let i = 0; i < this.rayDirections.length; i++) {
           const geom = new THREE.BufferGeometry().setFromPoints([
             new THREE.Vector3(0, 0, 0),
@@ -441,6 +671,17 @@
           this.scene.add(line);
           this.sensorLines.push(line);
         }
+      }
+
+      // 시작 위치/각도에 약간의 무작위성 (RL 일반화용)
+      jitterSpawn() {
+        const q = new THREE.Quaternion().setFromEuler(
+          new THREE.Euler((Math.random() - 0.5) * 0.16, (Math.random() - 0.5) * 0.16, 0));
+        this.mesh.quaternion.multiply(q);
+        const off = new THREE.Vector3((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, 0)
+          .applyQuaternion(this.mesh.quaternion);
+        this.position.add(off);
+        this.mesh.position.copy(this.position);
       }
 
       updateSensors(tubeMesh) {
@@ -455,16 +696,13 @@
 
           const intersects = raycaster.intersectObject(tubeMesh);
           if (intersects.length > 0) {
-            const dist = intersects[0].distance;
-            this.readings[i] = dist / this.sensorRange;
+            this.readings[i] = intersects[0].distance / this.sensorRange;
 
-            // Visual line update
             const lineGeom = this.sensorLines[i].geometry;
             const positions = lineGeom.attributes.position.array;
             positions[0] = this.position.x;
             positions[1] = this.position.y;
             positions[2] = this.position.z;
-
             const hitPos = intersects[0].point;
             positions[3] = hitPos.x;
             positions[4] = hitPos.y;
@@ -478,171 +716,245 @@
         }
       }
 
-      update(tubeMesh, ringCheckpoints, keys = {}, epsilon = 0.1, learningRate = 0.05, showSensors = true) {
+      // 관측 벡터. rich=false: GA용 11차원 / rich=true: RL용 17차원(다음 2개 링 방향 + 로컬 속도 + 거리)
+      buildObservation(ringCheckpoints, rich) {
+        const n = ringCheckpoints.length;
+        const inv = this.mesh.quaternion.clone().invert();
+        const toLocal = (ring) => ring.center.clone().sub(this.position).applyQuaternion(inv);
+
+        const rel1 = toLocal(ringCheckpoints[(this.currentRingIndex + 1) % n]);
+        const dist1 = rel1.length();
+        rel1.normalize();
+        const inputs = [...this.readings, rel1.x, rel1.y, rel1.z];
+
+        if (!rich) {
+          inputs.push(Math.min(1.0, this.velocity.length() / 3.0));
+          return inputs;
+        }
+        const rel2 = toLocal(ringCheckpoints[(this.currentRingIndex + 2) % n]).normalize();
+        const lv = this.velocity.clone().applyQuaternion(inv).multiplyScalar(1 / 3);
+        inputs.push(rel2.x, rel2.y, rel2.z,
+          clamp(lv.x, -1.5, 1.5), clamp(lv.y, -1.5, 1.5), clamp(lv.z, -1.5, 1.5),
+          Math.min(1.5, dist1 / 60));
+        return inputs;
+      }
+
+      update(tubeMesh, ringCheckpoints, keys = {}, showSensors = true) {
         if (this.damaged) return;
 
         this.timeSinceCheckpoint++;
         this.updateSensors(tubeMesh);
-
-        // Animate rotor blades
         this.rotors.forEach(r => r.rotation.y += 0.4);
 
-        if (this.modelType === 'HUMAN') {
-          this.handleHumanControls(keys);
-        } else {
-          this.handleAIControls(ringCheckpoints, epsilon, learningRate);
-        }
+        if (this.modelType === 'HUMAN') this.handleHumanControls(keys);
+        else if (this.modelType === 'GA') this.handleAIControls(ringCheckpoints);
+        else this.handleRLControls(ringCheckpoints);
 
         this.applyPhysics();
         this.checkCollisionAndProgress(tubeMesh, ringCheckpoints);
 
-        // Hide sensors if turned off
+        if (this.pending) {
+          this.traj.push({ ...this.pending, r: this.stepReward, done: this.damaged });
+          this.pending = null;
+        }
+
         this.sensorLines.forEach(l => l.visible = l.visible && showSensors);
       }
 
       handleHumanControls(keys) {
-        let pitchCmd = 0;
-        let yawCmd = 0;
-        let thrustCmd = 0;
+        let pitchCmd = 0, yawCmd = 0, thrustCmd = 0;
 
         if (keys.w || keys.W) pitchCmd = 1;
         if (keys.s || keys.S) pitchCmd = -1;
-        if (keys.a || keys.A) yawCmd = 1;
-        if (keys.d || keys.D) yawCmd = -1;
+        if (keys.a || keys.A || keys.ArrowLeft) yawCmd = 1;
+        if (keys.d || keys.D || keys.ArrowRight) yawCmd = -1;
         if (keys.ArrowUp) thrustCmd = 1;
         if (keys.ArrowDown) thrustCmd = -1;
 
         this.pitch = pitchCmd * 0.04;
         this.yaw = yawCmd * 0.04;
-        this.thrust = thrustCmd * 0.8 + 0.3; // Default forward thrust
+        this.thrust = thrustCmd * 0.8 + 0.3;
       }
 
-      handleAIControls(ringCheckpoints, epsilon, learningRate) {
-        const inputs = [...this.readings];
-
-        // Next Ring Target Direction
-        const targetRing = ringCheckpoints[(this.currentRingIndex + 1) % ringCheckpoints.length];
-        const relTarget = targetRing.center.clone().sub(this.position).applyQuaternion(this.mesh.quaternion.clone().invert()).normalize();
-
-        inputs.push(relTarget.x, relTarget.y, relTarget.z);
-        inputs.push(Math.min(1.0, this.velocity.length() / 3.0));
-
-        let outputs = this.brain.predict(inputs);
-
-        if (this.modelType === 'RL' && Math.random() < epsilon) {
-          outputs = [Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1];
-        }
-
+      handleAIControls(ringCheckpoints) {
+        const outputs = this.brain.predict(this.buildObservation(ringCheckpoints, false));
         this.pitch = outputs[0] * 0.05;
         this.yaw = outputs[1] * 0.05;
         this.thrust = outputs[2] * 0.6 + 0.4;
+      }
 
-        if (this.modelType === 'RL' && this.lastInputs) {
-          const minSensor = Math.min(...this.readings);
-          let reward = this.velocity.length() > 0.5 ? 0.2 : -0.1;
-          if (minSensor < 0.2) reward -= 0.6;
-
-          const grads = [outputs[0] * reward, outputs[1] * reward, outputs[2] * reward];
-          this.brain.applyGradient(this.lastInputs, grads, learningRate);
-        }
-
-        this.lastInputs = inputs;
+      handleRLControls(ringCheckpoints) {
+        const obs = this.buildObservation(ringCheckpoints, true);
+        const { action, logp, value } = this.agent.act(obs);
+        const a = action.map(v => clamp(v, -1, 1));
+        this.pitch = a[0] * 0.05;
+        this.yaw = a[1] * 0.05;
+        this.thrust = a[2] * 0.6 + 0.4;
+        this.pending = { obs, act: action, logp, v: value };
       }
 
       applyPhysics() {
-        // Rotate local orientation
         const deltaRotation = new THREE.Quaternion().setFromEuler(new THREE.Euler(this.pitch, this.yaw, 0, 'YXZ'));
         this.mesh.quaternion.multiply(deltaRotation);
 
-        // Forward & Upward thrust vectors
         const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(this.mesh.quaternion);
         const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.mesh.quaternion);
 
         const thrustAcc = forward.multiplyScalar(this.thrust * 0.25).add(up.multiplyScalar((this.thrust - 0.3) * 0.15));
         this.velocity.add(thrustAcc);
-        this.velocity.multiplyScalar(0.92); // Drag
+        this.velocity.multiplyScalar(0.92);
 
         this.position.add(this.velocity);
         this.mesh.position.copy(this.position);
       }
 
+      kill() {
+        this.damaged = true;
+        this.mesh.visible = false;
+        this.sensorLines.forEach(l => l.visible = false);
+      }
+
       checkCollisionAndProgress(tubeMesh, ringCheckpoints) {
-        // Check tube wall crash via minimum sensor distance
-        const minSensorDist = Math.min(...this.readings);
-        if (minSensorDist < 0.08) {
-          this.damaged = true;
-          this.mesh.visible = false;
-          this.sensorLines.forEach(l => l.visible = false);
+        this.stepReward = 0;
+        const minSensor = Math.min(...this.readings);
+
+        if (minSensor < 0.08) {           // 벽 충돌
+          this.stepReward = -3;
+          this.kill();
           return;
         }
 
-        // Check ring checkpoints
-        const nextRingIdx = (this.currentRingIndex + 1) % ringCheckpoints.length;
-        const targetRing = ringCheckpoints[nextRingIdx];
+        const n = ringCheckpoints.length;
+        const targetRing = ringCheckpoints[(this.currentRingIndex + 1) % n];
         const distToRing = this.position.distanceTo(targetRing.center);
 
+        let reward = 0;
+        if (this.prevDist !== null) reward += (this.prevDist - distToRing) * 0.05; // 목표 링에 가까워진 만큼 보상
+        this.prevDist = distToRing;
+
         if (distToRing < targetRing.radius * 0.9) {
-          this.currentRingIndex = nextRingIdx;
+          this.currentRingIndex = (this.currentRingIndex + 1) % n;
           this.timeSinceCheckpoint = 0;
           this.fitness += 500;
+          reward += 1.5;
+          this.prevDist = this.position.distanceTo(ringCheckpoints[(this.currentRingIndex + 1) % n].center);
         }
 
         this.fitness += this.velocity.length() * 2;
+        reward -= Math.max(0, 0.3 - minSensor) * 0.5; // 벽에 너무 붙으면 감점
 
-        if (this.timeSinceCheckpoint > 240) {
-          this.damaged = true;
-          this.mesh.visible = false;
-          this.sensorLines.forEach(l => l.visible = false);
+        if (this.timeSinceCheckpoint > 240) {         // 진전 없음
+          reward -= 2;
+          this.kill();
         }
+        this.stepReward = reward;
       }
 
       destroy() {
         this.scene.remove(this.mesh);
-        this.sensorLines.forEach(l => this.scene.remove(l));
+        this.mesh.traverse(o => {
+          if (o.geometry) o.geometry.dispose();
+          if (o.material) o.material.dispose();
+        });
+        this.sensorLines.forEach(l => {
+          this.scene.remove(l);
+          l.geometry.dispose();
+          l.material.dispose();
+        });
       }
     }
 
     // --- 3. 3D POLYGONAL TUBE TRACK GENERATOR ---
     class PolyTubeTrack3D {
-      constructor(scene, sides = 8, radius = 25) {
+      constructor(scene, sides = 8, radius = 25, points = null, label = '기본 코스') {
         this.scene = scene;
         this.sides = sides;
         this.radius = radius;
+        this.points = (points || PolyTubeTrack3D.classicPoints()).map(p => p.clone());
+        this.label = label;
         this.checkpoints = [];
         this.buildTrack();
       }
 
-      buildTrack() {
-        if (this.tubeMesh) this.scene.remove(this.tubeMesh);
-        if (this.ringGroup) this.scene.remove(this.ringGroup);
-
-        // Generate 3D Spline Curve with vertical loops and winding turns
+      static classicPoints() {
         const points = [];
         const numPoints = 12;
         for (let i = 0; i < numPoints; i++) {
           const angle = (i / numPoints) * Math.PI * 2;
-          const x = Math.sin(angle) * 180 + Math.sin(angle * 3) * 40;
-          const y = Math.sin(angle * 2) * 70; // 3D Height variation
-          const z = Math.cos(angle) * 180 + Math.cos(angle * 2) * 50;
-          points.push(new THREE.Vector3(x, y, z));
+          points.push(new THREE.Vector3(
+            Math.sin(angle) * 180 + Math.sin(angle * 3) * 40,
+            Math.sin(angle * 2) * 70,
+            Math.cos(angle) * 180 + Math.cos(angle * 2) * 50));
         }
+        return points;
+      }
 
-        this.curve = new THREE.CatmullRomCurve3(points, true);
-        
-        // Custom Polygonal Tube Geometry
+      static mulberry32(a) {
+        return function () {
+          a |= 0; a = a + 0x6D2B79F5 | 0;
+          let t = Math.imul(a ^ a >>> 15, 1 | a);
+          t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+          return ((t ^ t >>> 14) >>> 0) / 4294967296;
+        };
+      }
+
+      // 시드 기반 무작위 폐곡선 (xz 평면에서 각도 순서 유지 -> 자기교차 방지, y는 랜덤 파동)
+      static randomPoints(seed) {
+        const rnd = PolyTubeTrack3D.mulberry32(seed);
+        const n = 10 + Math.floor(rnd() * 5);
+        const baseR = 150 + rnd() * 70;
+        const ampY = 30 + rnd() * 60;
+        const f1 = 1 + Math.floor(rnd() * 3), f2 = 2 + Math.floor(rnd() * 3);
+        const ph1 = rnd() * Math.PI * 2, ph2 = rnd() * Math.PI * 2;
+        const sx = 0.8 + rnd() * 0.5, sz = 0.8 + rnd() * 0.5;
+        const step = Math.PI * 2 / n;
+        const raw = [];
+        for (let i = 0; i < n; i++) {
+          const ang = i * step + (rnd() - 0.5) * step * 0.5;
+          const r = baseR * (1 + (rnd() - 0.5) * 0.4);
+          const y = Math.sin(ang * f1 + ph1) * ampY + Math.sin(ang * f2 + ph2) * ampY * 0.4 + (rnd() - 0.5) * 20;
+          raw.push(new THREE.Vector3(Math.sin(ang) * r * sx, y, Math.cos(ang) * r * sz));
+        }
+        // 한 번 평활화해서 급커브 완화
+        return raw.map((p, i) => {
+          const a = raw[(i + n - 1) % n], b = raw[(i + 1) % n];
+          return new THREE.Vector3(
+            0.25 * a.x + 0.5 * p.x + 0.25 * b.x,
+            0.25 * a.y + 0.5 * p.y + 0.25 * b.y,
+            0.25 * a.z + 0.5 * p.z + 0.25 * b.z);
+        });
+      }
+
+      // 씬에서 완전히 제거 + GPU 메모리 해제 (이게 빠져 있어서 이전 코스가 남아 있었음)
+      dispose() {
+        [this.tubeMesh, this.ringGroup].forEach(obj => {
+          if (!obj) return;
+          this.scene.remove(obj);
+          obj.traverse(o => {
+            if (o.geometry) o.geometry.dispose();
+            if (o.material) o.material.dispose();
+          });
+        });
+        this.tubeMesh = null;
+        this.ringGroup = null;
+      }
+
+      buildTrack() {
+        this.dispose();
+
+        this.curve = new THREE.CatmullRomCurve3(this.points, true);
+
         const tubeGeo = new THREE.TubeGeometry(this.curve, 120, this.radius, this.sides, true);
         const tubeMat = new THREE.MeshStandardMaterial({
-          color: 0x1e293b,
-          wireframe: true,
-          side: THREE.BackSide,
-          transparent: true,
-          opacity: 0.6
+          color: 0x1e293b, wireframe: true, side: THREE.BackSide, transparent: true, opacity: 0.6
         });
-
         this.tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
         this.scene.add(this.tubeMesh);
 
-        // Create Ring Checkpoints
+        tubeGeo.computeBoundingSphere();
+        this.center = tubeGeo.boundingSphere.center.clone();
+        this.boundRadius = tubeGeo.boundingSphere.radius;
+
         this.checkpoints = [];
         this.ringGroup = new THREE.Group();
 
@@ -662,16 +974,11 @@
           this.ringGroup.add(ringMesh);
           this.checkpoints.push({ center: pt, tangent: tangent, radius: this.radius });
         }
-
         this.scene.add(this.ringGroup);
 
-        // Start Position
-        const startPt = this.curve.getPointAt(0);
+        this.startPos = this.curve.getPointAt(0);
         const startTan = this.curve.getTangentAt(0);
-        const startQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), startTan);
-
-        this.startPos = startPt;
-        this.startQuaternion = startQuat;
+        this.startQuaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), startTan);
       }
     }
 
@@ -689,34 +996,26 @@
         const resize = () => {
           this.canvas.width = this.canvas.parentElement.clientWidth - 16;
           this.canvas.height = this.canvas.parentElement.clientHeight - 16;
+          this.draw();
         };
         window.addEventListener('resize', resize);
         resize();
       }
 
-      addData(ga, rl) {
-        this.gaData.push(ga);
-        this.rlData.push(rl);
-        if (this.gaData.length > 25) {
-          this.gaData.shift();
-          this.rlData.shift();
-        }
-        this.draw();
-      }
+      addGA(v) { this.gaData.push(v); if (this.gaData.length > 60) this.gaData.shift(); this.draw(); }
+      addRL(v) { this.rlData.push(v); if (this.rlData.length > 60) this.rlData.shift(); this.draw(); }
+      clear() { this.gaData = []; this.rlData = []; this.draw(); }
 
       draw() {
-        const w = this.canvas.width;
-        const h = this.canvas.height;
+        const w = this.canvas.width, h = this.canvas.height;
         this.ctx.clearRect(0, 0, w, h);
-
-        if (this.gaData.length < 2) return;
         const maxFit = Math.max(...this.gaData, ...this.rlData, 1000);
 
         const drawLine = (data, color) => {
+          if (data.length < 2) return;
           this.ctx.beginPath();
           this.ctx.strokeStyle = color;
           this.ctx.lineWidth = 2.5;
-
           const stepX = w / (data.length - 1);
           for (let i = 0; i < data.length; i++) {
             const x = i * stepX;
@@ -726,7 +1025,6 @@
           }
           this.ctx.stroke();
         };
-
         drawLine(this.gaData, '#6366f1');
         drawLine(this.rlData, '#22d3ee');
       }
@@ -736,7 +1034,7 @@
     class DroneSimulation3D {
       constructor() {
         this.container = document.getElementById('canvas-container');
-        
+
         this.popSize = 25;
         this.mutationRate = 0.12;
         this.simSpeed = 1;
@@ -744,7 +1042,6 @@
 
         this.gaGen = 1;
         this.rlEp = 1;
-        this.rlEpsilon = 1.0;
 
         this.enableGA = true;
         this.enableRL = true;
@@ -753,10 +1050,20 @@
 
         this.keys = {};
         this.chart = new BenchmarkChart('chart-canvas');
+        this.agent = new PPOAgent();
+
+        this.gaFrame = 0;
+        this.rlFrame = 0;
+        this.playerDeadTimer = 0;
+        this.rlReturn = 0;
+        this.lastLeader = null;
 
         this.initThree();
+        this.initOrbitControls();
         this.initEvents();
         this.resetSimulation();
+        this.frameTrack();
+        this.updateTrackInfo();
         this.animate();
       }
 
@@ -764,22 +1071,142 @@
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(0x020617);
 
-        this.camera = new THREE.PerspectiveCamera(60, this.container.clientWidth / this.container.clientHeight, 0.1, 1000);
-        
+        this.camera = new THREE.PerspectiveCamera(60, this.container.clientWidth / this.container.clientHeight, 0.1, 5000);
+
         this.renderer = new THREE.WebGLRenderer({ antialias: true });
         this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
         this.renderer.setPixelRatio(window.devicePixelRatio);
         this.container.appendChild(this.renderer.domElement);
 
-        // Lighting
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-        this.scene.add(ambientLight);
-
+        this.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
         const dirLight = new THREE.DirectionalLight(0x38bdf8, 1.2);
         dirLight.position.set(100, 200, 100);
         this.scene.add(dirLight);
 
         this.track = new PolyTubeTrack3D(this.scene, 8);
+      }
+
+      // ---------- 블렌더/3ds Max 스타일 오빗 카메라 ----------
+      initOrbitControls() {
+        this.orbit = { target: new THREE.Vector3(), radius: 500, theta: 0.6, phi: 1.05 };
+        const el = this.renderer.domElement;
+        const pointers = new Map();
+        let mode = null;
+        let pinchDist = 0;
+        const pinch = () => {
+          const [a, b] = [...pointers.values()];
+          return Math.hypot(a.x - b.x, a.y - b.y);
+        };
+
+        el.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        el.addEventListener('pointerdown', (e) => {
+          if (el.setPointerCapture) el.setPointerCapture(e.pointerId);
+          pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          if (pointers.size === 1) {
+            mode = (e.button === 2 || e.shiftKey) ? 'pan' : 'rotate';
+            this.ensureFreeMode();
+          } else if (pointers.size === 2) {
+            mode = 'pinch';
+            pinchDist = pinch();
+          }
+        });
+
+        el.addEventListener('pointermove', (e) => {
+          const prev = pointers.get(e.pointerId);
+          if (!prev) return;
+          const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+          pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+          if (pointers.size === 1) {
+            if (mode === 'rotate') this.orbitRotate(dx, dy);
+            else if (mode === 'pan') this.orbitPan(dx, dy);
+          } else if (pointers.size === 2) {
+            const d = pinch();
+            if (pinchDist > 0 && d > 0) this.orbitZoom(pinchDist / d);
+            pinchDist = d;
+            this.orbitPan(dx / 2, dy / 2);
+          }
+        });
+
+        const up = (e) => {
+          pointers.delete(e.pointerId);
+          mode = pointers.size === 1 ? 'rotate' : null;
+        };
+        el.addEventListener('pointerup', up);
+        el.addEventListener('pointercancel', up);
+
+        el.addEventListener('wheel', (e) => {
+          e.preventDefault();
+          this.ensureFreeMode();
+          this.orbitZoom(Math.exp(e.deltaY * 0.001));
+        }, { passive: false });
+
+        el.addEventListener('dblclick', () => { this.ensureFreeMode(); this.frameTrack(); });
+      }
+
+      orbitRotate(dx, dy) {
+        const o = this.orbit;
+        o.theta -= dx * 0.008;
+        o.phi = clamp(o.phi - dy * 0.008, 0.05, Math.PI - 0.05);
+      }
+
+      orbitPan(dx, dy) {
+        const o = this.orbit;
+        const h = this.container.clientHeight || 600;
+        const k = 2 * o.radius * Math.tan(this.camera.fov * Math.PI / 360) / h;
+        const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+        const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+        o.target.addScaledVector(right, -dx * k).addScaledVector(up, dy * k);
+      }
+
+      orbitZoom(factor) {
+        this.orbit.radius = clamp(this.orbit.radius * factor, 8, 3000);
+      }
+
+      applyOrbit() {
+        const o = this.orbit;
+        const sp = Math.sin(o.phi);
+        this.camera.position.set(
+          o.target.x + o.radius * sp * Math.sin(o.theta),
+          o.target.y + o.radius * Math.cos(o.phi),
+          o.target.z + o.radius * sp * Math.cos(o.theta));
+        this.camera.lookAt(o.target);
+        this.camera.updateMatrix();
+      }
+
+      frameTrack() {
+        const t = this.track;
+        this.orbit.target.copy(t.center);
+        this.orbit.radius = Math.max(150, t.boundRadius * 2.3);
+        this.orbit.theta = 0.6;
+        this.orbit.phi = 1.05;
+      }
+
+      focusLeader() {
+        const leader = this.getLeader();
+        if (leader) {
+          this.orbit.target.copy(leader.position);
+          this.orbit.radius = Math.min(this.orbit.radius, 120);
+        }
+      }
+
+      setCameraMode(mode) {
+        this.cameraMode = mode;
+        document.querySelectorAll('.cam-btn').forEach(b => b.className = b.dataset.cam === mode ? CAM_ON : CAM_OFF);
+      }
+
+      // Chase/Top 상태에서 드래그·휠을 하면 지금 보던 위치 그대로 Free Orbit 으로 넘어감
+      ensureFreeMode() {
+        if (this.cameraMode === 'free') return;
+        const leader = this.getLeader();
+        const target = leader ? leader.position.clone() : this.orbit.target.clone();
+        const off = this.camera.position.clone().sub(target);
+        const r = Math.max(8, off.length());
+        this.orbit.target.copy(target);
+        this.orbit.radius = r;
+        this.orbit.theta = Math.atan2(off.x, off.z);
+        this.orbit.phi = Math.acos(clamp(off.y / r, -1, 1));
+        this.setCameraMode('free');
       }
 
       initEvents() {
@@ -789,19 +1216,21 @@
           this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
         });
 
-        window.addEventListener('keydown', (e) => this.keys[e.key] = true);
+        window.addEventListener('keydown', (e) => {
+          if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+          this.keys[e.key] = true;
+        });
         window.addEventListener('keyup', (e) => this.keys[e.key] = false);
 
+        // 단면(각형) 변경: 같은 곡선을 유지한 채 튜브만 새로 모델링 (이전 튜브는 제거)
         document.getElementById('select-tube-shape').addEventListener('change', (e) => {
           const sides = parseInt(e.target.value);
-          this.track = new PolyTubeTrack3D(this.scene, sides);
-          this.resetSimulation();
+          this.replaceTrack(new PolyTubeTrack3D(this.scene, sides, 25, this.track.points, this.track.label));
         });
 
+        // 새 무작위 곡선
         document.getElementById('btn-regen-track').addEventListener('click', () => {
-          const sides = parseInt(document.getElementById('select-tube-shape').value);
-          this.track = new PolyTubeTrack3D(this.scene, sides);
-          this.resetSimulation();
+          this.replaceTrack(this.makeRandomTrack(), true);
         });
 
         document.getElementById('slider-pop').addEventListener('input', (e) => {
@@ -817,13 +1246,15 @@
         document.getElementById('btn-restart').addEventListener('click', () => {
           this.gaGen = 1;
           this.rlEp = 1;
-          this.rlEpsilon = 1.0;
+          this.agent = new PPOAgent();
+          this.rlReturn = 0;
+          this.chart.clear();
           this.resetSimulation();
         });
 
         document.getElementById('btn-next-gen').addEventListener('click', () => {
-          this.evolveGA();
-          this.resetRL();
+          this.chart.addGA(this.evolveGA());
+          this.endRLEpisode();
         });
 
         document.getElementById('btn-toggle-sensors').addEventListener('click', () => {
@@ -838,19 +1269,22 @@
           const statusText = document.getElementById('player-status-text');
           statusText.textContent = this.enablePlayer ? '켜짐' : '꺼짐';
           statusText.className = this.enablePlayer ? 'text-emerald-400' : 'text-slate-400';
-          this.resetSimulation();
+          if (this.playerDrone) this.playerDrone.destroy();
+          this.playerDrone = this.enablePlayer ? this.spawnPlayer() : null;
         });
 
-        // Camera mode buttons
         document.querySelectorAll('.cam-btn').forEach(btn => {
           btn.addEventListener('click', () => {
-            document.querySelectorAll('.cam-btn').forEach(b => b.className = 'cam-btn px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300');
-            btn.className = 'cam-btn px-2.5 py-1 rounded bg-indigo-600 text-white shadow';
-            this.cameraMode = btn.dataset.cam;
+            this.setCameraMode(btn.dataset.cam);
+            if (btn.dataset.cam === 'free') this.frameTrack();
           });
         });
 
-        // Speed buttons
+        const fit = document.getElementById('btn-view-fit');
+        if (fit) fit.addEventListener('click', () => { this.setCameraMode('free'); this.frameTrack(); });
+        const focus = document.getElementById('btn-view-focus');
+        if (focus) focus.addEventListener('click', () => { this.ensureFreeMode(); this.focusLeader(); });
+
         document.querySelectorAll('.speed-btn').forEach(btn => {
           btn.addEventListener('click', () => {
             document.querySelectorAll('.speed-btn').forEach(b => b.className = 'speed-btn px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300');
@@ -860,29 +1294,74 @@
         });
       }
 
+      // ---------- 트랙 교체 ----------
+      makeRandomTrack() {
+        const sides = parseInt(document.getElementById('select-tube-shape').value) || 8;
+        const seed = Math.floor(Math.random() * 1e6);
+        return new PolyTubeTrack3D(this.scene, sides, 25, PolyTubeTrack3D.randomPoints(seed), `랜덤 #${seed}`);
+      }
+
+      replaceTrack(newTrack, reframe = false) {
+        this.trainRL();                 // 지금까지 모은 RL 경험은 먼저 학습에 반영
+        const old = this.track;
+        this.track = newTrack;
+        old.dispose();                  // 이전 코스 제거
+        this.respawnAll();
+        this.updateTrackInfo();
+        if (reframe) this.frameTrack();
+      }
+
+      updateTrackInfo() {
+        const el = document.getElementById('track-info');
+        if (el) el.textContent = `현재 코스: ${this.track.label} · ${this.track.sides}각 단면`;
+      }
+
+      // ---------- 드론 생성 ----------
+      spawnGA(brain = null) {
+        const d = new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'GA');
+        if (brain) d.brain = brain;
+        return d;
+      }
+      spawnRL() {
+        const d = new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'RL', this.agent);
+        d.jitterSpawn();
+        return d;
+      }
+      spawnPlayer() {
+        return new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'HUMAN');
+      }
+
       resetSimulation() {
         if (this.gaDrones) this.gaDrones.forEach(d => d.destroy());
         if (this.rlDrones) this.rlDrones.forEach(d => d.destroy());
         if (this.playerDrone) this.playerDrone.destroy();
 
-        this.gaDrones = [];
-        if (this.enableGA) {
-          for (let i = 0; i < this.popSize; i++) {
-            this.gaDrones.push(new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'GA'));
-          }
-        }
-
-        this.rlDrones = [];
-        if (this.enableRL) {
-          for (let i = 0; i < this.popSize; i++) {
-            this.rlDrones.push(new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'RL'));
-          }
-        }
-
-        this.playerDrone = this.enablePlayer ? new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'HUMAN') : null;
-        this.frameCount = 0;
+        this.gaDrones = this.enableGA ? Array.from({ length: this.popSize }, () => this.spawnGA()) : [];
+        this.rlDrones = this.enableRL ? Array.from({ length: this.popSize }, () => this.spawnRL()) : [];
+        this.playerDrone = this.enablePlayer ? this.spawnPlayer() : null;
+        this.gaFrame = 0;
+        this.rlFrame = 0;
+        this.playerDeadTimer = 0;
       }
 
+      // 학습된 뇌/정책은 유지하고 새 코스의 출발점에 다시 배치
+      respawnAll() {
+        const brains = this.gaDrones.map(d => d.brain);
+        this.gaDrones.forEach(d => d.destroy());
+        this.gaDrones = brains.map(b => this.spawnGA(b));
+
+        this.rlDrones.forEach(d => d.destroy());
+        this.rlDrones = this.enableRL ? Array.from({ length: this.popSize }, () => this.spawnRL()) : [];
+
+        if (this.playerDrone) this.playerDrone.destroy();
+        this.playerDrone = this.enablePlayer ? this.spawnPlayer() : null;
+
+        this.gaFrame = 0;
+        this.rlFrame = 0;
+        this.playerDeadTimer = 0;
+      }
+
+      // ---------- GA ----------
       evolveGA() {
         if (this.gaDrones.length === 0) return 0;
         this.gaDrones.sort((a, b) => b.fitness - a.fitness);
@@ -890,82 +1369,91 @@
 
         const newBrains = [];
         const eliteCount = Math.max(1, Math.floor(this.popSize * 0.15));
-        for (let i = 0; i < eliteCount; i++) {
-          newBrains.push(this.gaDrones[i].brain.clone());
-        }
+        for (let i = 0; i < eliteCount; i++) newBrains.push(this.gaDrones[i].brain.clone());
 
         while (newBrains.length < this.popSize) {
-          const parentA = this.gaDrones[Math.floor(Math.random() * 5)].brain;
-          const childBrain = parentA.clone();
-          childBrain.mutate(this.mutationRate);
-          newBrains.push(childBrain);
+          const parent = this.gaDrones[Math.floor(Math.random() * Math.min(5, this.gaDrones.length))].brain;
+          const child = parent.clone();
+          child.mutate(this.mutationRate);
+          newBrains.push(child);
         }
 
         this.gaDrones.forEach(d => d.destroy());
-        this.gaDrones = newBrains.map(b => {
-          const d = new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'GA');
-          d.brain = b;
-          return d;
-        });
-
+        this.gaDrones = newBrains.map(b => this.spawnGA(b));
         this.gaGen++;
+        this.gaFrame = 0;
         return bestFit;
       }
 
-      resetRL() {
-        if (this.rlDrones.length === 0) return 0;
-        this.rlDrones.sort((a, b) => b.fitness - a.fitness);
-        const bestFit = this.rlDrones[0].fitness;
+      // ---------- RL (PPO) ----------
+      rlLearningRate() {
+        return 0.0002 + this.mutationRate * 0.008; // 슬라이더 1%~40% -> 약 3e-4 ~ 3.4e-3
+      }
 
-        const topBrain = this.rlDrones[0].brain.clone();
-        this.rlEpsilon = Math.max(0.05, this.rlEpsilon * 0.9);
-
-        this.rlDrones.forEach(d => d.destroy());
-        this.rlDrones = [];
-
-        for (let i = 0; i < this.popSize; i++) {
-          const d = new Drone3D(this.scene, this.track.startPos, this.track.startQuaternion, 'RL');
-          d.brain = topBrain.clone();
-          if (i > 0) d.brain.mutate(this.mutationRate * 0.5);
-          this.rlDrones.push(d);
+      trainRL() {
+        const cps = this.track.checkpoints;
+        const trajs = [];
+        let bestFit = 0, retSum = 0, n = 0;
+        for (const d of this.rlDrones) {
+          bestFit = Math.max(bestFit, d.fitness);
+          if (d.traj.length === 0) continue;
+          const bootstrap = d.damaged ? 0 : this.agent.value(d.buildObservation(cps, true));
+          trajs.push({ steps: d.traj, bootstrap });
+          retSum += d.traj.reduce((s, x) => s + x.r, 0);
+          n++;
         }
+        if (trajs.length) this.agent.train(trajs, this.rlLearningRate());
+        if (n) this.rlReturn = this.rlReturn === 0 ? retSum / n : 0.8 * this.rlReturn + 0.2 * (retSum / n);
+        return bestFit;
+      }
 
+      endRLEpisode() {
+        if (this.rlDrones.length === 0) return 0;
+        const bestFit = this.trainRL();
+        this.chart.addRL(bestFit);
+        this.rlDrones.forEach(d => d.destroy());
+        this.rlDrones = Array.from({ length: this.popSize }, () => this.spawnRL());
         this.rlEp++;
+        this.rlFrame = 0;
         return bestFit;
       }
 
       update() {
         for (let step = 0; step < this.simSpeed; step++) {
-          this.frameCount++;
+          this.gaFrame++;
+          this.rlFrame++;
+          const tube = this.track.tubeMesh;
+          const cps = this.track.checkpoints;
 
           let gaAlive = 0;
-          this.gaDrones.forEach(d => {
-            d.update(this.track.tubeMesh, this.track.checkpoints, {}, 0, 0, this.showSensors);
-            if (!d.damaged) gaAlive++;
-          });
+          for (const d of this.gaDrones) { d.update(tube, cps, {}, this.showSensors); if (!d.damaged) gaAlive++; }
 
           let rlAlive = 0;
-          this.rlDrones.forEach(d => {
-            d.update(this.track.tubeMesh, this.track.checkpoints, {}, this.rlEpsilon, this.mutationRate * 0.5, this.showSensors);
-            if (!d.damaged) rlAlive++;
-          });
+          for (const d of this.rlDrones) { d.update(tube, cps, {}, this.showSensors); if (!d.damaged) rlAlive++; }
 
           if (this.playerDrone) {
-            this.playerDrone.update(this.track.tubeMesh, this.track.checkpoints, this.keys, 0, 0, this.showSensors);
+            this.playerDrone.update(tube, cps, this.keys, this.showSensors);
+            if (this.playerDrone.damaged) {
+              if (++this.playerDeadTimer > 90) {   // 충돌 후 잠시 뒤 출발점에서 부활
+                this.playerDrone.destroy();
+                this.playerDrone = this.spawnPlayer();
+                this.playerDeadTimer = 0;
+              }
+            }
           }
 
-          if (gaAlive + rlAlive === 0 || this.frameCount > 1200) {
-            const bestGA = this.evolveGA();
-            const bestRL = this.resetRL();
-            this.chart.addData(bestGA, bestRL);
-
+          // GA 세대 종료
+          if (this.gaDrones.length && (gaAlive === 0 || this.gaFrame > 1200)) {
+            this.chart.addGA(this.evolveGA());
             if (document.getElementById('chk-auto-regen').checked) {
-              const sides = parseInt(document.getElementById('select-tube-shape').value);
-              this.track = new PolyTubeTrack3D(this.scene, sides);
+              this.replaceTrack(this.makeRandomTrack());
+              break;
             }
+          }
 
-            this.frameCount = 0;
-            break;
+          // RL 에피소드 종료 (GA와 독립적으로 — 전원 추락하면 바로 학습)
+          if (this.rlDrones.length && (rlAlive === 0 || this.rlFrame > 1200)) {
+            this.endRLEpisode();
           }
         }
 
@@ -973,38 +1461,44 @@
         this.updateUI();
       }
 
-      updateCamera() {
-        const leader = this.playerDrone || this.gaDrones.find(d => !d.damaged) || this.rlDrones.find(d => !d.damaged);
+      getLeader() {
+        const alive = [this.playerDrone, ...this.gaDrones, ...this.rlDrones].find(d => d && !d.damaged);
+        if (alive) this.lastLeader = alive;
+        return alive || this.lastLeader || this.playerDrone;
+      }
 
-        if (this.cameraMode === 'free' || !leader) {
-          this.camera.position.set(0, 120, 260);
-          this.camera.lookAt(0, 0, 0);
-        } else if (this.cameraMode === 'top') {
+      updateCamera() {
+        if (this.cameraMode === 'free') { this.applyOrbit(); return; }
+        const leader = this.getLeader();
+        if (!leader) return;
+
+        if (this.cameraMode === 'top') {
           this.camera.position.copy(leader.position).add(new THREE.Vector3(0, 80, 0));
           this.camera.lookAt(leader.position);
-        } else if (this.cameraMode === 'chase') {
+        } else {
           const chaseOffset = new THREE.Vector3(0, 8, -25).applyQuaternion(leader.mesh.quaternion);
-          const targetCamPos = leader.position.clone().add(chaseOffset);
-          this.camera.position.lerp(targetCamPos, 0.1);
+          this.camera.position.lerp(leader.position.clone().add(chaseOffset), 0.1);
           this.camera.lookAt(leader.position.clone().add(new THREE.Vector3(0, 2, 10).applyQuaternion(leader.mesh.quaternion)));
         }
+        this.camera.updateMatrix();
       }
 
       updateUI() {
-        document.getElementById('stat-ga-gen').textContent = this.gaGen;
-        document.getElementById('stat-rl-ep').textContent = this.rlEp;
+        const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+        set('stat-ga-gen', this.gaGen);
+        set('stat-rl-ep', this.rlEp);
 
         const gaAlive = this.gaDrones.filter(d => !d.damaged).length;
         const rlAlive = this.rlDrones.filter(d => !d.damaged).length;
-
-        document.getElementById('stat-ga-alive').textContent = `${gaAlive}/${this.gaDrones.length}`;
-        document.getElementById('stat-rl-alive').textContent = `${rlAlive}/${this.rlDrones.length}`;
+        set('stat-ga-alive', `${gaAlive}/${this.gaDrones.length}`);
+        set('stat-rl-alive', `${rlAlive}/${this.rlDrones.length}`);
 
         const bestGA = this.gaDrones.reduce((max, d) => d.fitness > max ? d.fitness : max, 0);
         const bestRL = this.rlDrones.reduce((max, d) => d.fitness > max ? d.fitness : max, 0);
-
-        document.getElementById('stat-ga-fit').textContent = Math.floor(bestGA);
-        document.getElementById('stat-rl-fit').textContent = Math.floor(bestRL);
+        set('stat-ga-fit', Math.floor(bestGA));
+        set('stat-rl-fit', Math.floor(bestRL));
+        set('stat-rl-ret', this.rlReturn.toFixed(1));
+        set('stat-rl-std', this.agent.meanStd().toFixed(2));
       }
 
       animate() {
